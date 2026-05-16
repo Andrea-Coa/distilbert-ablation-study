@@ -10,15 +10,15 @@ model_name: "bert-base-uncased"
 
 # ── Heredar de la mejor configuración ──────────────────────────
 # Reemplazar los ??? con los valores de la config ganadora.
-freeze_strategy: "???"          # ej: "frozen_all" si C4 gana
-trainable_layers: null          # solo si freeze_strategy = "partial"
-classifier_type: "???"          # ej: "bottleneck" si C4 gana
+freeze_strategy: "partial"          # ej: "frozen_all" si C4 gana
+trainable_layers: [4, 5]          # solo si freeze_strategy = "partial"
+classifier_type: "linear"          # ej: "bottleneck" si C4 gana
 hidden_dims: []                 # ej: [128, 64] si C4 gana
 
 dropout: 0.1
 learning_rate: 2.0e-5
 weight_decay: 0.01
-num_epochs: 3
+num_epochs: 4
 seed: 42
 fp16: true
 gradient_accumulation_steps: 1
