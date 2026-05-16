@@ -8,7 +8,7 @@ ni eficiencia (eso es efficiency.py).
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -34,49 +34,78 @@ def train_and_evaluate(
     exp_cfg: ExperimentConfig,
     dataset_cfg: DatasetConfig,
     device: torch.device,
+    checkpoint_callback=None,   # ← NUEVO: DriveCheckpointer o None
+    resume_state: Optional[Dict] = None,  # ← NUEVO: estado previo o None
 ) -> Tuple[nn.Module, TrainHistory]:
     """
     Loop completo de entrenamiento + evaluación en validation.
 
+    Args:
+        checkpoint_callback: instancia de DriveCheckpointer, o None para
+                             deshabilitar checkpointing (comportamiento original).
+        resume_state:        dict devuelto por DriveCheckpointer.load(), o None
+                             para empezar desde la época 1.
+
     Returns:
-        (model entrenado, historial de curvas de loss)
+        (model entrenado, historial de curvas de loss, training_time)
     """
     train_loader = loaders["train"]
     val_loader = loaders["val"]
 
-    # ── Optimizer ──────────────────────────────────────────────────────────────
-    optimizer = AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=exp_cfg.learning_rate,
-        weight_decay=exp_cfg.weight_decay,
-    )
+    # ── Optimizer ─────────────────────────────────────────────────────────────
+    # Si resume_state contiene un optimizer ya cargado desde el checkpoint,
+    # lo reutilizamos (preserva los momentos de Adam). Si no, creamos uno nuevo.
+    if resume_state is not None and "optimizer" in resume_state:
+        optimizer = resume_state["optimizer"]
+        print("[trainer] Reutilizando optimizer desde checkpoint.")
+    else:
+        optimizer = AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=exp_cfg.learning_rate,
+            weight_decay=exp_cfg.weight_decay,
+        )
 
     # ── Scheduler ─────────────────────────────────────────────────────────────
     steps_per_epoch = len(train_loader) // exp_cfg.gradient_accumulation_steps
     total_steps = steps_per_epoch * exp_cfg.num_epochs
     warmup_steps = int(0.1 * total_steps)
 
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps,
-    )
+    if resume_state is not None and "scheduler" in resume_state:
+        scheduler = resume_state["scheduler"]
+        print("[trainer] Reutilizando scheduler desde checkpoint.")
+    else:
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
 
     # ── Mixed precision ────────────────────────────────────────────────────────
     use_fp16 = exp_cfg.fp16 and device.type == "cuda"
-    scaler = GradScaler() if use_fp16 else None
+    if resume_state is not None and "scaler" in resume_state:
+        scaler = resume_state["scaler"]
+        print("[trainer] Reutilizando GradScaler desde checkpoint.")
+    else:
+        scaler = GradScaler() if use_fp16 else None
 
     print(f"\n[trainer] fp16={'ON' if use_fp16 else 'OFF'}, "
           f"gradient_accumulation_steps={exp_cfg.gradient_accumulation_steps}")
     print(f"[trainer] total_steps={total_steps}, warmup_steps={warmup_steps}")
     print(f"[trainer] Iniciando entrenamiento por {exp_cfg.num_epochs} épocas...\n")
 
-    history: TrainHistory = {
-        "train_loss_by_step": [],
-        "val_loss_by_epoch": [],
-    }
+    # ── Reanudar desde checkpoint si se provee ─────────────────────────────────
+    if resume_state is not None:
+        history     = resume_state["history"]
+        global_step = resume_state["global_step"]
+        start_epoch = resume_state["epoch"] + 1
+    else:
+        history: TrainHistory = {
+            "train_loss_by_step": [],
+            "val_loss_by_epoch": [],
+        }
+        global_step = 0
+        start_epoch = 1
 
-    global_step = 0
     accum_loss = 0.0
     accum_steps_count = 0
     training_start = time.time()
@@ -84,7 +113,7 @@ def train_and_evaluate(
     model.to(device)
     model.train()
 
-    for epoch in range(1, exp_cfg.num_epochs + 1):
+    for epoch in range(start_epoch, exp_cfg.num_epochs + 1):
         print(f"─── Época {epoch}/{exp_cfg.num_epochs} ──────────────────────────")
 
         optimizer.zero_grad()
@@ -151,6 +180,18 @@ def train_and_evaluate(
             "loss": round(val_loss, 6),
         })
         print(f"  → val_loss={val_loss:.4f}")
+
+        # ── Checkpoint al final de cada época (si está habilitado) ────────────
+        if checkpoint_callback is not None:
+            checkpoint_callback.save(
+                epoch=epoch,
+                global_step=global_step,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                history=history,
+                scaler=scaler,
+            )
 
     training_time = time.time() - training_start
     print(f"\n[trainer] Entrenamiento completado en {training_time:.1f}s")
